@@ -1,6 +1,14 @@
+<!--
+ * @Author       : Chongyang Li
+ * @Email        : lichongyang2016@163.com
+ * @Date         : 2025-11-10 20:23:28
+ * @LastEditors  : Chongyang Li
+ * @LastEditTime : 2025-11-10 20:37:26
+ * @FilePath     : /BPG_LDPC/README.md
+-->
 # BPG / JPEG + LDPC 图像传输性能测试
 
-使用 [BPG]([BPG Image format](https://bellard.org/bpg/)) 和 [Sionna]([NVlabs/sionna: Sionna: An Open-Source Library for Research on Communication Systems](https://github.com/NVlabs/sionna)) 实现图像压缩与传输的性能测试
+使用 [BPG](https://bellard.org/bpg/) 和 [Sionna](https://github.com/NVlabs/sionna) 实现图像压缩与传输的性能测试
 
 
 
