@@ -1,11 +1,3 @@
-<!--
- * @Author       : Chongyang Li
- * @Email        : lichongyang2016@163.com
- * @Date         : 2025-11-10 20:23:28
- * @LastEditors  : Chongyang Li
- * @LastEditTime : 2025-11-10 20:37:26
- * @FilePath     : /BPG_LDPC/README.md
--->
 # BPG / JPEG + LDPC 图像传输性能测试
 
 使用 [BPG](https://bellard.org/bpg/) 和 [Sionna](https://github.com/NVlabs/sionna) 实现图像压缩与传输的性能测试
@@ -15,15 +7,15 @@
 ## requirements
 
 ```shell
-matplotlib==3.10.7
-numpy==2.3.4
-Pillow==12.0.0
-sionna==1.2.1
-sionna_rt==1.2.1
-tensorflow==2.14.0
-torch==2.1.1+cu118
-torchvision==0.16.1+cu118
-tqdm==4.66.4
+matplotlib==3.10.8
+numpy==2.4.4
+Pillow==12.1.1
+sionna==2.0.0
+sionna_rt==2.0.0
+torch==2.10.0+cu130
+torchvision==0.25.0+cu130
+tqdm==4.67.3
+
 ```
 
 
@@ -31,7 +23,9 @@ tqdm==4.66.4
 ## Usage
 
 ```shell
-# setting the communication system parament and run ldpc.py
+# 设置好仿真参数后运行 ldpc.py
+# test_loader 跑CIFAR10的结果  kodak_loader跑Kodak数据集
+# 可以设置SNR 与 压缩质量 一次
 python ldpc.py
 ```
 

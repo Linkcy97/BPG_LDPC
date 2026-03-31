@@ -3,7 +3,7 @@
 # Email        : lichongyang2016@163.com
 # Date         : 2024-10-10 08:35:53
 # LastEditors  : Chongyang Li
-# LastEditTime : 2025-11-10 20:22:18
+# LastEditTime : 2026-03-31 18:08:17
 # FilePath     : /BPG_LDPC/ldpc.py
 
 from PIL import Image
@@ -14,10 +14,6 @@ from utils import *
 import os, sys
 import logging
 os.chdir(sys.path[0])
-if os.getenv("CUDA_VISIBLE_DEVICES") is None:
-    gpu_num = 0 # Use "" to use the CPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu_num}"
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 import sionna
 from sionna.phy.mimo import lmmse_equalizer
@@ -27,9 +23,6 @@ from sionna.phy.channel import FlatFadingChannel, AWGN
 from sionna.phy.fec.ldpc.encoding import LDPC5GEncoder
 from sionna.phy.fec.ldpc.decoding import LDPC5GDecoder
 from sionna.phy.utils.metrics import compute_ber
-
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
 from torchvision import io, datasets
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
@@ -37,7 +30,7 @@ from distortion import *
 
 torch.manual_seed(0)
 seed = np.random.RandomState(42)
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CalcuSSIM = MS_SSIM(data_range=1., levels=4, channel=3)
 
     
@@ -55,7 +48,7 @@ test_dataset = datasets.CIFAR10(root="/home/linkcy97/Datasets/CIFAR10/",
 # indices = np.random.choice(len(test_dataset), 100, replace=False)
 indices = list(range(9000, 9050))
 subset_dataset = Subset(test_dataset, indices)
-
+# Kodak dataset
 kodak_dataset = Datasets(["/home/linkcy97/Datasets/Kodak/"])
 
 test_loader = DataLoader(dataset=subset_dataset,
@@ -74,7 +67,10 @@ demapping_method = "app" # try "max-log"
 ldpc_cn_type = "boxplus" # try also "minsum"
 nbits = 2                # number of bits mapped to one symbol (cf. QAM)
 code_rate = 1/4          # LDPC code rate  
-max_k = 3840             # maximum number of information bits per LDPC codeword 1/4: 3840, 1/2: 8448
+if code_rate <= 1/4:
+    max_k = 3840             # maximum number of information bits per LDPC codeword 8448
+else:
+    max_k = 8448
 constellation = Constellation("qam", nbits)
 mapper = Mapper(constellation=constellation)
 multiple_snr = [7]             # set of SNR points to simulate
@@ -84,6 +80,7 @@ if channel_type == 'awgn':
 else:
     channel = FlatFadingChannel(1, 1, add_awgn=True, return_channel=True)
 demapper = Demapper(demapping_method, constellation=constellation)
+
 
 def ldpc_encode_blocks(blocks, ldpc_rate):
     """
@@ -106,13 +103,10 @@ def ldpc_decode_blocks(received_blocks, k, n, num_bits, num_blocks):
     decoder = LDPC5GDecoder(encoder, hard_out=True)
 
     decoded = decoder(received_blocks)  # [batch*num_blocks, k]
-
-    # reshape 回原始 [batch, num_blocks*k]
-    batch_size = tf.shape(received_blocks)[0] // num_blocks
-    decoded = tf.reshape(decoded, [batch_size, num_blocks*k])
+    decoded = decoded.reshape(num_blocks * k)
 
     # 截断 padding 部分，恢复到原始 num_bits
-    decoded = decoded[:, :num_bits]
+    decoded = decoded[:num_bits]
 
     return decoded
 
@@ -163,47 +157,43 @@ def test_bpg_ldpc_channel_single_image(
     bpg_bits = dec2bin(bpg_data_tensor, 8)  # shape: [num_bytes*8]
 
     # 4) 建立 sionna LDPC + 信道模型
-    #    - 假设 bpg_bits_tf shape: [1, K], K = bpg_bits_tf.shape[1]
-    bpg_bits_tf = tf.convert_to_tensor(bpg_bits.unsqueeze(0).numpy(), dtype=tf.float32)
-    blocks, num_bits, num_blocks  = split_into_blocks(bpg_bits_tf, max_k)
+    blocks, num_bits, num_blocks  = split_into_blocks(bpg_bits, max_k)
     c, k, n = ldpc_encode_blocks(blocks, ldpc_rate)
     x = mapper(c)              # [1, N/4]
     no = sionna.phy.utils.ebnodb2no(ebno_db, 2**nbits, ldpc_rate)
 
     if channel_type == 'rayleigh':
         # x: [B, T]（mapper 输出先确保是 [B, T]，不要多余的末尾维）
-        B = tf.shape(x)[0]
-        T = tf.shape(x)[1]
+        B, T = x.size(0), x.size(1)
         # 1) 把时间维展平到 batch： [B*T, 1]（SISO: Nt=1）
-        x_flat = tf.reshape(x, [-1, 1])                # [B*T, 1]
+        x_flat = x.view(-1, 1)           # [B*T, 1]
         # 2) 过平坦瑞利信道
         #    y: [B*T, 1], h: [B*T, 1, 1]
         y, h = channel(x_flat, no)
         # 3) LMMSE 等化（SISO -> 噪声协方差是 1x1）
-        s = tf.cast(no*tf.eye(1), y.dtype)             # [1,1]
-        x_hat, no_eff = lmmse_equalizer(y, h, s)       # [B*T, 1]
+        s = (no * torch.eye(1, device=y.device)).to(y.dtype)            # [1,1]
+        x_hat, no_eff = lmmse_equalizer(y, h, s)                        # [B*T, 1]
         # 4) 还原回 [B, T]，送 demapper
-        x_hat = tf.reshape(x_hat, [B, T])              # [B, T]
+        x_hat = x_hat.view(B, T)                                        # [B, T]
         llr = demapper(x_hat, no)
     if channel_type == 'awgn':
         y = channel(x, no)
         llr = demapper(y, no)
     b_hat = ldpc_decode_blocks(llr, k, n, num_bits, num_blocks)
     # 计算BER（可选）
-    # ber_coded = compute_ber(bpg_bits_tf, b_hat)
+    # ber_coded = compute_ber(bpg_bits, b_hat)
     # print(f"EbNo={ebno_db}dB, BPG+LDPC BER={ber_coded:.4e}")
 
     # 6) 重组BPG字节流并写回文件
-    b_hat = torch.from_numpy(b_hat.numpy()).to(torch.uint8).squeeze(0)    # shape: [K]
     b_hat_bytes = bin2dec(b_hat.view(-1, 8), 8)                           # [num_bytes]
     # b_hat_bytes 还是 torch.uint8，转成 list 然后变成真正的bytearray
     # final_bpg_data = header_bytes + bytes(b_hat_bytes.tolist())
-    final_bpg_data = bytes(b_hat_bytes.numpy().tolist())
+    b_hat_bytes = b_hat_bytes.to(torch.uint8).cpu()
 
     # 需要考虑传输一个符号携带多少比特
     cbr = (bpg_data_tensor.nelement() * (8 / nbits)) / (raw_img_tensor.nelement()) / ldpc_rate
     with open(temp_bpg_received, 'wb') as f:
-        f.write(bytearray(final_bpg_data))
+        f.write(bytearray(b_hat_bytes))
 
     # 7) 调用 bpgdec 解码 -> temp_recon.png
     try:
@@ -239,7 +229,7 @@ def bpg_after_channel():
                 ebno_db = snrdb2no(multiple_snr[i], 2**nbits, code_rate)
                 psnr, cbr, ms_ssim = test_bpg_ldpc_channel_single_image(
                                         img, bpg_quality=quality,          #  35 30 20 15 10
-                                        ldpc_rate=code_rate,               # 1/2 1/3 1/5
+                                        ldpc_rate=code_rate,               #  1/2 1/3 1/5
                                         max_k=max_k,ebno_db=ebno_db,
                                         channel_type=channel_type)
                 cbrs.update(cbr)
@@ -260,7 +250,7 @@ def test_jpeg_ldpc_channel_single_image(
     raw_img_tensor,
     jpeg_quality=75,
     ldpc_rate=0.5,
-    max_k=3840,
+    max_k=8448,
     ebno_db=6.0,
     channel_type=channel_type):
     """
@@ -276,10 +266,9 @@ def test_jpeg_ldpc_channel_single_image(
 
     # 2) 转换为比特流
     jpeg_bits = dec2bin(jpeg_bytes, 8)  # [num_bytes*8]
-    jpeg_bits_tf = tf.convert_to_tensor(jpeg_bits.unsqueeze(0).numpy(), dtype=tf.float32)
 
     # 3) 切分成 LDPC 块
-    blocks, num_bits, num_blocks = split_into_blocks(jpeg_bits_tf, max_k)
+    blocks, num_bits, num_blocks = split_into_blocks(jpeg_bits, max_k)
 
     # 4) LDPC 编码 + 调制
     c, k, n = ldpc_encode_blocks(blocks, ldpc_rate)
@@ -287,18 +276,17 @@ def test_jpeg_ldpc_channel_single_image(
     no = ebnodb2no(ebno_db, 2**nbits, ldpc_rate)
 
     if channel_type == 'rayleigh':
-        B = tf.shape(x)[0]
-        T = tf.shape(x)[1]
+        B, T = x.size(0), x.size(1)
         # 1) [B*T, 1]（SISO: Nt=1）
-        x_flat = tf.reshape(x, [-1, 1])                # [B*T, 1]
+        x_flat = x.view(-1, 1)                         # [B*T, 1]
         # 2) 过衰落信道
         #    y: [B*T, 1], h: [B*T, 1, 1]
         y, h = channel(x_flat, no)
         # 3) LMMSE 均衡 (SISO -> noise 方差是 1x1)
-        s = tf.cast(no*tf.eye(1), y.dtype)             # [1,1]
-        x_hat, no_eff = lmmse_equalizer(y, h, s)       # [B*T, 1]
+        s = (no * torch.eye(1, device=y.device)).to(y.dtype)          # [1,1]
+        x_hat, no_eff = lmmse_equalizer(y, h, s)                      # [B*T, 1]
         # 4) 还原尺寸到 [B, T] 解调
-        x_hat = tf.reshape(x_hat, [B, T])              # [B, T]
+        x_hat = x_hat.view(B, T)                                      # [B, T]
         llr = demapper(x_hat, no)
     if channel_type == 'awgn':
         y = channel(x, no)
@@ -308,16 +296,15 @@ def test_jpeg_ldpc_channel_single_image(
     b_hat = ldpc_decode_blocks(llr, k, n, num_bits, num_blocks)
 
     # 6) 重组 JPEG 字节流
-    b_hat = torch.from_numpy(b_hat.numpy()).to(torch.uint8).squeeze(0)    # shape: [K]
     b_hat_bytes = bin2dec(b_hat.view(-1, 8), 8)                           # [num_bytes]
-    final_jpeg_data = bytes(b_hat_bytes.numpy().tolist())
+    b_hat_bytes = b_hat_bytes.to(torch.uint8).cpu()
 
     # 7) 解码 JPEG
     try:
-        de_img = io.decode_jpeg(torch.tensor(list(final_jpeg_data), dtype=torch.uint8))
+        de_img = io.decode_jpeg(b_hat_bytes, device='cuda')
         psnr_val = calculate_psnr(torch.squeeze(raw_img_tensor, 0).float(), de_img.float())
-        ms_ssim = 1 - CalcuSSIM(raw_img_tensor/255., 
-                                (de_img.unsqueeze(0)/255.).clamp(0., 1.)).mean().item()
+        ms_ssim = 1 - CalcuSSIM((raw_img_tensor/255.).cpu(), 
+                                (de_img.unsqueeze(0)/255.).clamp(0., 1.).cpu()).mean().item()
     except:
         # JPEG 解码失败（位错误太多）
         de_img = torch.zeros_like(torch.squeeze(raw_img_tensor, 0))
@@ -335,11 +322,11 @@ def jpeg_after_channel():
         level=logging.INFO,
         format='%(asctime)s %(levelname)s: %(message)s')
     logging.info(f"channel: {channel_type}")
-    for quality in [1,2,3,4,5,6]:              # set of JPEG quality factors
+    for quality in [1, 10, 30, 50, 75]:              # set of JPEG quality factors
         for i in range(len(multiple_snr)):
             psnrs, cbrs, ssims = [AverageMeter() for _ in range(3)]
             for j, data in enumerate(tqdm(kodak_loader)):
-                img = data
+                img = data.cuda()
                 ebno_db = snrdb2no(multiple_snr[i], 2**nbits, code_rate)
                 psnr, cbr, ms_ssim = test_jpeg_ldpc_channel_single_image(
                                 img, jpeg_quality=quality,ldpc_rate=code_rate,
@@ -365,9 +352,7 @@ def cifar_no_channel():
         for j, data in enumerate(tqdm(test_loader_all)):
             raw_img, _ = data
             raw_img = torch.squeeze(raw_img, 0)
-            # JPEG encode
             en_img = io.encode_jpeg(raw_img, i)
-
             de_img = io.decode_jpeg(en_img)
             cbrs.update(en_img.nbytes / raw_img.nbytes / 0.5)
             psnrs.update(calculate_psnr(raw_img, de_img))
@@ -384,7 +369,6 @@ def kodak_no_channel():
         for j, data in enumerate(tqdm(kodak_loader)):
             raw_img = data
             raw_img = torch.squeeze(raw_img, 0)
-            # JPEG encode
             en_img = io.encode_jpeg(raw_img, i)
             de_img = io.decode_jpeg(en_img)
             cbrs.update(en_img.nbytes / raw_img.nbytes / 0.5)
@@ -411,7 +395,7 @@ def test_channel():
     demapper = Demapper(demapping_method,
                         constellation=constellation)
     decoder = LDPC5GDecoder(encoder,hard_out=True,
-                            cn_type=ldpc_cn_type,
+                            cn_update=ldpc_cn_type,
                             num_iter=20)
     # simulation parameters
     batch_size = 1000
@@ -445,14 +429,14 @@ def test_channel():
     print("Shape after decoding: ", b_hat.shape)
 
     # calculate BERs
-    c_hat = tf.cast(tf.less(0.0, llr), tf.float32) # hard-decided bits before dec.
+    c_hat = (llr < 0.0).float()              # hard-decided bits before dec.
     ber_uncoded = compute_ber(c, c_hat)
 
     ber_coded = compute_ber(b, b_hat)
 
     print("BER uncoded = {:.3f} at EbNo = {:.1f} dB".format(ber_uncoded, ebno_db))
     print("BER after decoding = {:.3f} at EbNo = {:.1f} dB".format(ber_coded, ebno_db))
-    print("In total {} bits were simulated".format(np.size(b.numpy())))
+    print("In total {} bits were simulated".format(b.numel()))
 
 
 if __name__ == "__main__":

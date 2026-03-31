@@ -3,13 +3,13 @@
 # Email        : lichongyang2016@163.com
 # Date         : 2025-11-10 17:25:06
 # LastEditors  : Chongyang Li
-# LastEditTime : 2025-11-10 20:22:41
+# LastEditTime : 2026-03-31 17:30:35
 # FilePath     : /BPG_LDPC/utils.py
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 import numpy as np
 import subprocess
-import tensorflow as tf
 from glob import glob
 from torch.utils.data.dataset import Dataset
 import torchvision.transforms as transforms
@@ -115,17 +115,23 @@ def bpg_decompress(input_bpg, output_file, extra_options=None):
     # print("BPG decompression done. Output =>", output_file)
 
 def split_into_blocks(bits_tensor, max_k):
-    """将比特流分割成最大为max_k的小块"""
-    batch_size = tf.shape(bits_tensor)[0]
-    num_bits = bits_tensor.shape[1]
+    """将比特流分割成最大为 max_k 的小块"""
+    num_bits = bits_tensor.size(0)
     
     num_blocks = (num_bits + max_k - 1) // max_k
     total_bits = num_blocks * max_k
     
-    # padding 到完整的 block 数
-    padded = tf.pad(bits_tensor, [[0,0],[0, total_bits - num_bits]])
+    # 计算需要 padding 的长度
+    pad_len = total_bits - num_bits
+    
+    # F.pad 的 padding 格式是从最后一个维度开始的: (pad_left, pad_right)
+    # 这里我们只在最后一个维度的右侧 (尾部) 填充 pad_len 个 0
+    padded = F.pad(bits_tensor, (0, pad_len))
+    
     # reshape 成 [batch*num_blocks, max_k]
-    blocks = tf.reshape(padded, [batch_size*num_blocks, max_k])
+    # 使用 .view() 比 .reshape() 在 PyTorch 中更规范且高效（零拷贝）
+    blocks = padded.view(num_blocks, max_k)
+    
     return blocks, num_bits, num_blocks
 
 
