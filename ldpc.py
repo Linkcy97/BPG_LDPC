@@ -3,19 +3,15 @@
 # Email        : lichongyang2016@163.com
 # Date         : 2024-10-10 08:35:53
 # LastEditors  : Chongyang Li
-# LastEditTime : 2026-03-31 18:08:17
+# LastEditTime : 2026-06-24 18:17:04
 # FilePath     : /BPG_LDPC/ldpc.py
 
 from PIL import Image
 import torch
 from tqdm import tqdm
 import numpy as np
-from utils import *
-import os, sys
 import logging
-os.chdir(sys.path[0])
-
-import sionna
+import os
 from sionna.phy.mimo import lmmse_equalizer
 from sionna.phy.mapping import Demapper, Mapper, Constellation, BinarySource
 from sionna.phy.utils import ebnodb2no
@@ -26,7 +22,22 @@ from sionna.phy.utils.metrics import compute_ber
 from torchvision import io, datasets
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
-from distortion import *
+from distortion import MS_SSIM, calculate_psnr
+from utils import (
+    AverageMeter,
+    Datasets,
+    split_into_blocks,
+    bpg_compress,
+    bpg_decompress,
+    save_image,
+    dec2bin,
+    bin2dec,
+    snrdb2no,
+)
+
+PROTECT_METADATA = False  # 是否保护BPG/JPEG头部元数据，避免格式信息丢失导致解码失败
+PROTECTED_BYTES_BPG = 20  # BPG头文件通常极小，保护前20字节足以覆盖HWC和格式信息
+SAVE_IMAGES = False  # 是否保存原图和重建图像用于可视化
 
 torch.manual_seed(0)
 seed = np.random.RandomState(42)
@@ -66,21 +77,35 @@ kodak_loader = DataLoader(dataset=kodak_dataset,
 demapping_method = "app" # try "max-log"
 ldpc_cn_type = "boxplus" # try also "minsum"
 nbits = 2                # number of bits mapped to one symbol (cf. QAM)
-code_rate = 1/4          # LDPC code rate  
+code_rate = 1/2          # LDPC code rate  
 if code_rate <= 1/4:
     max_k = 3840             # maximum number of information bits per LDPC codeword 8448
 else:
     max_k = 8448
 constellation = Constellation("qam", nbits)
 mapper = Mapper(constellation=constellation)
-multiple_snr = [7]             # set of SNR points to simulate
-channel_type = 'rayleigh'  # 'awgn' or 'rayleigh'
+multiple_snr = [-7,-5,-3,-1,1,3,5,7]             # set of SNR points to simulate
+channel_type = "rayleigh"  # 'awgn' or 'rayleigh'
 if channel_type == 'awgn':
     channel = AWGN()
 else:
     channel = FlatFadingChannel(1, 1, add_awgn=True, return_channel=True)
 demapper = Demapper(demapping_method, constellation=constellation)
 
+
+def get_jpeg_header_length(jpeg_bytes_tensor):
+    """
+    动态解析 JPEG 字节流，找到实际图像数据开始的位置。
+    返回需要保护的 Header 字节数。
+    """
+    bytes_list = jpeg_bytes_tensor.tolist()
+    for i in range(len(bytes_list) - 1):
+        if bytes_list[i] == 0xFF and bytes_list[i + 1] == 0xDA:
+            # 0xFF 0xDA 是 SOS (Start of Scan)
+            # SOS 区段带有自己的长度，通常为 12 字节，之后才是真正的熵编码数据
+            sos_len = (bytes_list[i + 2] << 8) | bytes_list[i + 3]
+            return i + 2 + sos_len
+    return 150  # 如果解析失败，默认保护前 150 个字节
 
 def ldpc_encode_blocks(blocks, ldpc_rate):
     """
@@ -112,6 +137,7 @@ def ldpc_decode_blocks(received_blocks, k, n, num_bits, num_blocks):
 
 def test_bpg_ldpc_channel_single_image(
     raw_img_tensor,
+    name,
     bpg_quality=30,
     ldpc_rate=0.2,
     max_k=3840,
@@ -129,10 +155,14 @@ def test_bpg_ldpc_channel_single_image(
     :param channel_type: 'awgn' 或 'rayleigh'
     :return: psnr, cbr
     """
+    os.makedirs('./bpg', exist_ok=True)
     temp_input_png = "temp_input.png"
     temp_bpg = "temp_output.bpg"
     temp_bpg_received = "temp_received.bpg"
-    temp_recon_png = "temp_recon.png"
+    if SAVE_IMAGES:
+        temp_recon_png = f"./bpg/{name}_q_{bpg_quality}_snr_{int(ebno_db)}.png"
+    else:
+        temp_recon_png = "temp_output.png"
 
     # 保存图像为PNG文件
     pil_img = transforms.ToPILImage()(torch.squeeze(raw_img_tensor, 0))
@@ -155,12 +185,19 @@ def test_bpg_ldpc_channel_single_image(
 
     # 3) 把BPG字节流转换成比特 (每字节8bit)
     bpg_bits = dec2bin(bpg_data_tensor, 8)  # shape: [num_bytes*8]
+    if PROTECT_METADATA:
+        protect_len = min(PROTECTED_BYTES_BPG * 8, bpg_bits.shape[0])
+        header_bits = bpg_bits[:protect_len]
+        payload_bits = bpg_bits[protect_len:]
+    else:
+        payload_bits = bpg_bits
+        header_bits = None
 
     # 4) 建立 sionna LDPC + 信道模型
-    blocks, num_bits, num_blocks  = split_into_blocks(bpg_bits, max_k)
+    blocks, num_bits, num_blocks = split_into_blocks(payload_bits, max_k)
     c, k, n = ldpc_encode_blocks(blocks, ldpc_rate)
     x = mapper(c)              # [1, N/4]
-    no = sionna.phy.utils.ebnodb2no(ebno_db, 2**nbits, ldpc_rate)
+    no = ebnodb2no(ebno_db, 2**nbits, ldpc_rate)
 
     if channel_type == 'rayleigh':
         # x: [B, T]（mapper 输出先确保是 [B, T]，不要多余的末尾维）
@@ -179,15 +216,17 @@ def test_bpg_ldpc_channel_single_image(
     if channel_type == 'awgn':
         y = channel(x, no)
         llr = demapper(y, no)
-    b_hat = ldpc_decode_blocks(llr, k, n, num_bits, num_blocks)
+    b_hat_payload = ldpc_decode_blocks(llr, k, n, num_bits, num_blocks)
+    if PROTECT_METADATA and header_bits is not None:
+        b_hat = torch.cat([header_bits.to(device=b_hat_payload.device), b_hat_payload])
+    else:
+        b_hat = b_hat_payload
     # 计算BER（可选）
     # ber_coded = compute_ber(bpg_bits, b_hat)
     # print(f"EbNo={ebno_db}dB, BPG+LDPC BER={ber_coded:.4e}")
 
     # 6) 重组BPG字节流并写回文件
     b_hat_bytes = bin2dec(b_hat.view(-1, 8), 8)                           # [num_bytes]
-    # b_hat_bytes 还是 torch.uint8，转成 list 然后变成真正的bytearray
-    # final_bpg_data = header_bytes + bytes(b_hat_bytes.tolist())
     b_hat_bytes = b_hat_bytes.to(torch.uint8).cpu()
 
     # 需要考虑传输一个符号携带多少比特
@@ -218,18 +257,19 @@ def test_bpg_ldpc_channel_single_image(
 
 def bpg_after_channel():
     logging.basicConfig(
-        filename='bpg.log',           # 日志文件名
-        level=logging.INFO,           # 日志级别
-        format='%(asctime)s %(levelname)s: %(message)s')
-    for quality in [49, 47, 45, 43, 41]:                           # 49, 47, 45, 43, 41
+        filename=f"bpg_{channel_type}_{PROTECT_METADATA}.log",  # 日志文件名
+        level=logging.INFO,  # 日志级别
+        format="%(asctime)s %(levelname)s: %(message)s",
+    )
+    for quality in [42]:                           # 49, 47, 45, 43, 41
         for i in range(len(multiple_snr)):
             psnrs, cbrs, ssim = [AverageMeter() for _ in range(3)]
             for j, data in enumerate(tqdm(kodak_loader)):
                 img = data
                 ebno_db = snrdb2no(multiple_snr[i], 2**nbits, code_rate)
                 psnr, cbr, ms_ssim = test_bpg_ldpc_channel_single_image(
-                                        img, bpg_quality=quality,          #  35 30 20 15 10
-                                        ldpc_rate=code_rate,               #  1/2 1/3 1/5
+                                        img, j, bpg_quality=quality,          #  35 30 20 15 10
+                                        ldpc_rate=code_rate,                  #  1/2 1/3 1/5
                                         max_k=max_k,ebno_db=ebno_db,
                                         channel_type=channel_type)
                 cbrs.update(cbr)
@@ -248,6 +288,7 @@ def bpg_after_channel():
 
 def test_jpeg_ldpc_channel_single_image(
     raw_img_tensor,
+    name,
     jpeg_quality=75,
     ldpc_rate=0.5,
     max_k=8448,
@@ -267,8 +308,17 @@ def test_jpeg_ldpc_channel_single_image(
     # 2) 转换为比特流
     jpeg_bits = dec2bin(jpeg_bytes, 8)  # [num_bytes*8]
 
+    if PROTECT_METADATA:
+        header_len_bytes = get_jpeg_header_length(jpeg_bytes)
+        protect_len = min(header_len_bytes * 8, jpeg_bits.shape[0])
+        header_bits = jpeg_bits[:protect_len]
+        payload_bits = jpeg_bits[protect_len:]
+    else:
+        payload_bits = jpeg_bits
+        header_bits = None
+
     # 3) 切分成 LDPC 块
-    blocks, num_bits, num_blocks = split_into_blocks(jpeg_bits, max_k)
+    blocks, num_bits, num_blocks = split_into_blocks(payload_bits, max_k)
 
     # 4) LDPC 编码 + 调制
     c, k, n = ldpc_encode_blocks(blocks, ldpc_rate)
@@ -293,7 +343,11 @@ def test_jpeg_ldpc_channel_single_image(
         llr = demapper(y, no)
 
     # 5) LDPC 解码
-    b_hat = ldpc_decode_blocks(llr, k, n, num_bits, num_blocks)
+    b_hat_payload = ldpc_decode_blocks(llr, k, n, num_bits, num_blocks)
+    if PROTECT_METADATA and header_bits is not None:
+        b_hat = torch.cat([header_bits.to(device=b_hat_payload.device), b_hat_payload])
+    else:
+        b_hat = b_hat_payload
 
     # 6) 重组 JPEG 字节流
     b_hat_bytes = bin2dec(b_hat.view(-1, 8), 8)                           # [num_bytes]
@@ -305,6 +359,12 @@ def test_jpeg_ldpc_channel_single_image(
         psnr_val = calculate_psnr(torch.squeeze(raw_img_tensor, 0).float(), de_img.float())
         ms_ssim = 1 - CalcuSSIM((raw_img_tensor/255.).cpu(), 
                                 (de_img.unsqueeze(0)/255.).clamp(0., 1.).cpu()).mean().item()
+        if SAVE_IMAGES:
+            save_image(
+                torch.squeeze(raw_img_tensor, 0),
+                de_img,
+                f"./jpeg/{name}_q_{jpeg_quality}_snr_{int(ebno_db)}",
+            )
     except:
         # JPEG 解码失败（位错误太多）
         de_img = torch.zeros_like(torch.squeeze(raw_img_tensor, 0))
@@ -318,18 +378,19 @@ def test_jpeg_ldpc_channel_single_image(
 
 def jpeg_after_channel():
     logging.basicConfig(
-        filename='jpeg.log',
+        filename=f"jpeg_{channel_type}_{PROTECT_METADATA}.log",
         level=logging.INFO,
-        format='%(asctime)s %(levelname)s: %(message)s')
+        format="%(asctime)s %(levelname)s: %(message)s",
+    )
     logging.info(f"channel: {channel_type}")
-    for quality in [1, 10, 30, 50, 75]:              # set of JPEG quality factors
+    for quality in [1]:              # set of JPEG quality factors
         for i in range(len(multiple_snr)):
             psnrs, cbrs, ssims = [AverageMeter() for _ in range(3)]
             for j, data in enumerate(tqdm(kodak_loader)):
                 img = data.cuda()
                 ebno_db = snrdb2no(multiple_snr[i], 2**nbits, code_rate)
                 psnr, cbr, ms_ssim = test_jpeg_ldpc_channel_single_image(
-                                img, jpeg_quality=quality,ldpc_rate=code_rate,
+                                img, j, jpeg_quality=quality,ldpc_rate=code_rate,
                                 max_k=max_k, ebno_db=ebno_db,
                                 channel_type=channel_type)
                 cbrs.update(cbr)

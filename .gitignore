@@ -1,1 +1,7 @@
 __pycache__
+bpg
+jpeg
+*.bpg
+*.jpeg
+*.png
+*.log

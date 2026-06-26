@@ -3,7 +3,7 @@
 # Email        : lichongyang2016@163.com
 # Date         : 2025-11-10 17:25:06
 # LastEditors  : Chongyang Li
-# LastEditTime : 2026-03-31 17:30:35
+# LastEditTime : 2026-06-24 09:38:56
 # FilePath     : /BPG_LDPC/utils.py
 import matplotlib.pyplot as plt
 import torch
@@ -20,24 +20,28 @@ plt.rcParams["savefig.bbox"] = 'tight'
 
 
 def save_image(raw_img, de_img, name):
-        raw_img = raw_img.squeeze(0).permute(1,2,0).detach().cpu().numpy()
-        de_img = de_img.squeeze(0).permute(1,2,0).detach().cpu().numpy()
-        raw_img = raw_img / 255. if raw_img.max() > 1.1 else raw_img
-        de_img = de_img / 255. if de_img.max() > 1.1 else de_img
+    raw_img = raw_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+    de_img = de_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+    raw_img = raw_img / 255.0 if raw_img.max() > 1.1 else raw_img
+    de_img = de_img / 255.0 if de_img.max() > 1.1 else de_img
 
-        plt.figure(figsize=(7,15))
+    plt.figure(figsize=(7, 15))
 
-        plt.subplot(2,1,1)
-        plt.imshow(raw_img)
-        plt.axis('off')
+    plt.subplot(2, 1, 1)
+    plt.imshow(raw_img)
+    plt.axis("off")
 
-        plt.subplot(2,1,2)
-        plt.imshow(de_img)
-        plt.axis('off')
+    plt.subplot(2, 1, 2)
+    plt.imshow(de_img)
+    plt.axis("off")
 
-        plt.savefig('%s.png' % name)
-        plt.close()
-
+    save_path = "%s.png" % name
+    dir_name = os.path.dirname(save_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+    
 def dec2bin(x, bits):
     # mask = 2 ** torch.arange(bits).to(x.device, x.dtype)
     mask = 2 ** torch.arange(bits - 1, -1, -1).to(x.device, x.dtype)
