@@ -3,7 +3,7 @@
 # Email        : lichongyang2016@163.com
 # Date         : 2024-10-10 08:35:53
 # LastEditors  : Chongyang Li
-# LastEditTime : 2026-06-24 18:17:04
+# LastEditTime : 2026-09-15 08:11:17
 # FilePath     : /BPG_LDPC/ldpc.py
 
 from PIL import Image
@@ -37,7 +37,7 @@ from utils import (
 
 PROTECT_METADATA = False  # 是否保护BPG/JPEG头部元数据，避免格式信息丢失导致解码失败
 PROTECTED_BYTES_BPG = 20  # BPG头文件通常极小，保护前20字节足以覆盖HWC和格式信息
-SAVE_IMAGES = False  # 是否保存原图和重建图像用于可视化
+SAVE_IMAGES = True  # 是否保存原图和重建图像用于可视化
 
 torch.manual_seed(0)
 seed = np.random.RandomState(42)
@@ -61,6 +61,7 @@ indices = list(range(9000, 9050))
 subset_dataset = Subset(test_dataset, indices)
 # Kodak dataset
 kodak_dataset = Datasets(["/home/linkcy97/Datasets/Kodak/"])
+# kodak_dataset = Datasets(["./test/"])
 
 test_loader = DataLoader(dataset=subset_dataset,
                             batch_size=1,
@@ -84,7 +85,7 @@ else:
     max_k = 8448
 constellation = Constellation("qam", nbits)
 mapper = Mapper(constellation=constellation)
-multiple_snr = [-7,-5,-3,-1,1,3,5,7]             # set of SNR points to simulate
+multiple_snr = [-7, -5, -3, -1, 1, 3, 5, 7]  # set of SNR points to simulate
 channel_type = "rayleigh"  # 'awgn' or 'rayleigh'
 if channel_type == 'awgn':
     channel = AWGN()
@@ -212,7 +213,7 @@ def test_bpg_ldpc_channel_single_image(
         x_hat, no_eff = lmmse_equalizer(y, h, s)                        # [B*T, 1]
         # 4) 还原回 [B, T]，送 demapper
         x_hat = x_hat.view(B, T)                                        # [B, T]
-        llr = demapper(x_hat, no)
+        llr = demapper(x_hat, no_eff.reshape_as(x_hat))
     if channel_type == 'awgn':
         y = channel(x, no)
         llr = demapper(y, no)
@@ -261,7 +262,7 @@ def bpg_after_channel():
         level=logging.INFO,  # 日志级别
         format="%(asctime)s %(levelname)s: %(message)s",
     )
-    for quality in [42]:                           # 49, 47, 45, 43, 41
+    for quality in [49, 47, 45, 43, 41]:                           # 49, 47, 45, 43, 41
         for i in range(len(multiple_snr)):
             psnrs, cbrs, ssim = [AverageMeter() for _ in range(3)]
             for j, data in enumerate(tqdm(kodak_loader)):
