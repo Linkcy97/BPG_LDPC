@@ -5,6 +5,7 @@
 
 
 ## requirements
+https://bellard.org/bpg/
 
 ```shell
 matplotlib==3.10.8
